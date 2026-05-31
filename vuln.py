@@ -167,7 +167,11 @@ DEFAULT_HEADERS = {
     "User-Agent": "WebScan/1.0 (defensive audit) requests"
 }
 MAX_WORKERS = 12
-MAX_CRAWL_PAGES = 30
+MAX_CRAWL_PAGES = 80
+MAX_SITEMAP_URLS = 600
+MAX_SITEMAP_FILES = 12
+MAX_JS_FILES = 20
+CACHE_TTL_SECONDS = 300
 STATIC_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -387,6 +391,182 @@ def fetch_sitemap_urls(session, sitemap_url, *, limit=300):
     return urls
 
 
+def fetch_sitemap_urls_recursive(session, sitemap_url, *, url_limit=MAX_SITEMAP_URLS, sitemap_limit=MAX_SITEMAP_FILES):
+    queue = [sitemap_url]
+    seen = set()
+    urls = []
+
+    while queue and len(seen) < sitemap_limit and len(urls) < url_limit:
+        current = queue.pop(0)
+        if not current or current in seen:
+            continue
+        seen.add(current)
+
+        r, _ = safe_request(session, "GET", current, timeout=DEFAULT_TIMEOUT)
+        if r is None or r.status_code != 200:
+            continue
+
+        text = (r.text or "").strip()
+        if not text:
+            continue
+
+        try:
+            root = ET.fromstring(text)
+        except Exception:
+            continue
+
+        root_tag = root.tag.split("}")[-1].lower()
+        if root_tag == "sitemapindex":
+            for el in root.iter():
+                tag = el.tag.split("}")[-1].lower()
+                if tag == "loc":
+                    loc = (el.text or "").strip()
+                    if loc and loc not in seen and loc not in queue and len(seen) + len(queue) < sitemap_limit:
+                        queue.append(loc)
+            continue
+
+        for el in root.iter():
+            tag = el.tag.split("}")[-1].lower()
+            if tag == "loc":
+                loc = (el.text or "").strip()
+                if loc:
+                    urls.append(loc)
+                    if len(urls) >= url_limit:
+                        break
+
+    return urls
+
+
+_crawl_cache = {}
+
+
+def normalize_crawl_url(url):
+    try:
+        p = urlparse(url)
+        if not p.scheme or not p.netloc:
+            return url
+        netloc = p.netloc.lower()
+        path = p.path or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        normalized = f"{p.scheme}://{netloc}{path}"
+        if p.query:
+            normalized += f"?{p.query}"
+        return normalized
+    except Exception:
+        return url
+
+
+def extract_script_srcs(html, base_url, base_host):
+    urls = set()
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+        for s in soup.find_all("script"):
+            src = (s.get("src") or "").strip()
+            if not src:
+                continue
+            abs_url = urljoin(base_url.rstrip("/") + "/", src)
+            p = urlparse(abs_url)
+            if p.netloc and p.netloc.lower() != base_host.lower():
+                continue
+            urls.add(abs_url.split("#", 1)[0])
+    except Exception:
+        return set()
+    return urls
+
+
+def get_site_snapshot(domain, *, session=None, max_pages=MAX_CRAWL_PAGES, use_cache=True, show_progress=True):
+    domain = normalize_domain(domain)
+    if not domain:
+        return []
+
+    session = session or get_http_session()
+    cache_key = (domain, int(max_pages))
+    now = time.time()
+    if use_cache:
+        cached = _crawl_cache.get(cache_key)
+        if cached and (now - cached["ts"]) < CACHE_TTL_SECONDS:
+            return cached["pages"]
+
+    base_host = urlparse(domain).netloc.lower()
+    disallows, sitemaps = fetch_robots_paths(session, domain)
+
+    seed_urls = [domain]
+    for p in sorted(disallows)[:120]:
+        if p.startswith("/"):
+            seed_urls.append(build_url(domain, p))
+
+    if not sitemaps:
+        sitemaps = {build_url(domain, "/sitemap.xml")}
+
+    for sm in list(sitemaps)[:3]:
+        for u in fetch_sitemap_urls_recursive(session, sm, url_limit=240, sitemap_limit=6):
+            host = parse_hostname(u)
+            if host and host.lower() == base_host:
+                seed_urls.append(u)
+
+    queue = []
+    queued = set()
+    for u in seed_urls:
+        u = normalize_crawl_url(u)
+        if u and u not in queued:
+            queue.append(u)
+            queued.add(u)
+
+    visited = set()
+    pages = []
+
+    def handle(url):
+        r, _ = safe_request(session, "GET", url, timeout=DEFAULT_TIMEOUT)
+        if r is None:
+            return [], None
+
+        final_url = normalize_crawl_url(r.url)
+        html = r.text or "" if is_probably_html_response(r) else ""
+        pages.append({
+            "url": final_url,
+            "status": r.status_code,
+            "headers": dict(r.headers) if r.headers else {},
+            "html": html
+        })
+
+        if not html:
+            return [], final_url
+
+        links = extract_internal_links(html, final_url, base_host)
+        return [normalize_crawl_url(x) for x in links], final_url
+
+    if show_progress:
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Crawling site...", total=max_pages)
+            while queue and len(visited) < max_pages:
+                current = queue.pop(0)
+                if current in visited:
+                    continue
+                visited.add(current)
+                progress.update(task, description=f"[cyan]Crawling:[/cyan] {current}")
+                links, _ = handle(current)
+                for link in links:
+                    if link and link not in visited and link not in queued and (len(visited) + len(queue)) < max_pages:
+                        queue.append(link)
+                        queued.add(link)
+                progress.advance(task)
+    else:
+        while queue and len(visited) < max_pages:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            links, _ = handle(current)
+            for link in links:
+                if link and link not in visited and link not in queued and (len(visited) + len(queue)) < max_pages:
+                    queue.append(link)
+                    queued.add(link)
+
+    _crawl_cache[cache_key] = {"ts": now, "pages": pages}
+    return pages
+
+
 def discover_subdomain_references(domain, *, session=None, show_progress=True, return_details=False):
     domain = normalize_domain(domain)
     if not domain:
@@ -397,28 +577,6 @@ def discover_subdomain_references(domain, *, session=None, show_progress=True, r
 
     base_host = urlparse(domain).netloc.lower()
     base_domain = base_domain_from_host(base_host)
-
-    disallows, sitemaps = fetch_robots_paths(session, domain)
-    if not sitemaps:
-        sitemaps = {build_url(domain, "/sitemap.xml")}
-
-    seed_urls = [domain]
-    for p in sorted(disallows)[:50]:
-        if p.startswith("/"):
-            seed_urls.append(build_url(domain, p))
-
-    for sm in list(sitemaps)[:3]:
-        for u in fetch_sitemap_urls(session, sm, limit=120):
-            host = parse_hostname(u)
-            if host and host == base_host:
-                seed_urls.append(u)
-
-    queue = []
-    visited = set()
-    for u in seed_urls:
-        if u and u not in visited:
-            queue.append(u)
-            visited.add(u)
 
     found = {}
 
@@ -436,16 +594,25 @@ def discover_subdomain_references(domain, *, session=None, show_progress=True, r
 
     host_pattern = re.compile(r"https?://([a-z0-9.-]+\.[a-z]{2,})", re.I)
 
-    def analyze(url):
-        r, _ = safe_request(session, "GET", url, timeout=DEFAULT_TIMEOUT)
-        if r is None or r.status_code not in [200, 301, 302, 403]:
-            return set()
-        if not is_probably_html_response(r):
-            return set()
+    pages = get_site_snapshot(domain, session=session, max_pages=MAX_CRAWL_PAGES, use_cache=True, show_progress=show_progress)
 
-        html = r.text or ""
+    script_urls = set()
+    for page in pages:
+        page_url = page.get("url") or domain
+        html = page.get("html") or ""
+        headers = page.get("headers") or {}
+
+        for v in headers.values():
+            if not isinstance(v, str):
+                continue
+            for m in host_pattern.findall(v):
+                record(m, page_url)
+
+        if not html:
+            continue
+
         for m in host_pattern.findall(html):
-            record(m, r.url)
+            record(m, page_url)
 
         try:
             soup = BeautifulSoup(html, "html.parser")
@@ -456,39 +623,33 @@ def discover_subdomain_references(domain, *, session=None, show_progress=True, r
                         continue
                     host = parse_hostname(v)
                     if host:
-                        record(host, r.url)
+                        record(host, page_url)
         except Exception:
             pass
 
-        links = extract_internal_links(html, r.url, base_host)
-        return links
+        for js in extract_script_srcs(html, page_url, base_host):
+            script_urls.add(js)
 
-    crawl_queue = queue[:]
-    seen_pages = set()
-
-    if show_progress:
-        with Progress() as progress:
-            task = progress.add_task("[cyan]Discovering subdomain references...", total=MAX_CRAWL_PAGES)
-            while crawl_queue and len(seen_pages) < MAX_CRAWL_PAGES:
-                u = crawl_queue.pop(0)
-                if u in seen_pages:
-                    continue
-                seen_pages.add(u)
-                links = analyze(u)
-                for link in links:
-                    if link not in seen_pages and link not in crawl_queue and (len(seen_pages) + len(crawl_queue)) < MAX_CRAWL_PAGES:
-                        crawl_queue.append(link)
-                progress.advance(task)
-    else:
-        while crawl_queue and len(seen_pages) < MAX_CRAWL_PAGES:
-            u = crawl_queue.pop(0)
-            if u in seen_pages:
-                continue
-            seen_pages.add(u)
-            links = analyze(u)
-            for link in links:
-                if link not in seen_pages and link not in crawl_queue and (len(seen_pages) + len(crawl_queue)) < MAX_CRAWL_PAGES:
-                    crawl_queue.append(link)
+    if script_urls:
+        js_list = list(script_urls)[:MAX_JS_FILES]
+        if show_progress:
+            with Progress() as progress:
+                task = progress.add_task("[cyan]Scanning JS for subdomain refs...", total=len(js_list))
+                for js_url in js_list:
+                    progress.update(task, description=f"[cyan]JS subdomain scan:[/cyan] {js_url}")
+                    r, _ = safe_request(session, "GET", js_url, timeout=DEFAULT_TIMEOUT)
+                    if r is not None and r.status_code == 200:
+                        text = r.text or ""
+                        for m in host_pattern.findall(text):
+                            record(m, js_url)
+                    progress.advance(task)
+        else:
+            for js_url in js_list:
+                r, _ = safe_request(session, "GET", js_url, timeout=DEFAULT_TIMEOUT)
+                if r is not None and r.status_code == 200:
+                    text = r.text or ""
+                    for m in host_pattern.findall(text):
+                        record(m, js_url)
 
     if not found:
         if not return_details:
@@ -571,12 +732,9 @@ def check_xss_indicators(domain, *, session=None, show_progress=True, return_det
 
     session = session or get_http_session()
 
-    parsed_base = urlparse(domain)
-    base_host = parsed_base.netloc
-
-    queue = [domain]
-    visited = set()
+    base_host = urlparse(domain).netloc
     findings = {}
+    script_urls = set()
 
     def add_finding(url, indicators):
         if not indicators:
@@ -587,20 +745,37 @@ def check_xss_indicators(domain, *, session=None, show_progress=True, return_det
         else:
             existing.update(indicators)
 
-    def analyze_html(url):
-        r, err = safe_request(session, "GET", url, timeout=DEFAULT_TIMEOUT)
-        if r is None:
-            return set(), err
+    pages = get_site_snapshot(domain, session=session, max_pages=MAX_CRAWL_PAGES, use_cache=True, show_progress=show_progress)
 
-        if not is_probably_html_response(r):
-            return set(), None
+    sinks = [
+        ("innerhtml", "innerHTML"),
+        ("outerhtml", "outerHTML"),
+        ("insertadjacenthtml", "insertAdjacentHTML"),
+        ("document.write", "document.write"),
+        ("document.writeln", "document.writeln"),
+        ("eval(", "eval"),
+        ("new function", "Function"),
+        ("settimeout(", "setTimeout"),
+        ("setinterval(", "setInterval"),
+        ("location.hash", "location.hash"),
+        ("location.search", "location.search"),
+        ("document.location", "document.location"),
+        ("document.url", "document.URL"),
+        ("window.name", "window.name"),
+    ]
 
-        text = r.text or ""
-        text_l = text.lower()
+    for page in pages:
+        page_url = page.get("url") or ""
+        html = page.get("html") or ""
+        headers = page.get("headers") or {}
 
+        if not html:
+            continue
+
+        text_l = html.lower()
         indicators = set()
 
-        csp = r.headers.get("Content-Security-Policy") or ""
+        csp = headers.get("Content-Security-Policy") or headers.get("content-security-policy") or ""
         if not csp:
             indicators.add("missing_csp")
         else:
@@ -610,22 +785,7 @@ def check_xss_indicators(domain, *, session=None, show_progress=True, return_det
             if "unsafe-eval" in csp_l:
                 indicators.add("csp_unsafe_eval")
 
-        for needle, label in [
-            ("innerhtml", "innerHTML"),
-            ("outerhtml", "outerHTML"),
-            ("insertadjacenthtml", "insertAdjacentHTML"),
-            ("document.write", "document.write"),
-            ("document.writeln", "document.writeln"),
-            ("eval(", "eval"),
-            ("new function", "Function"),
-            ("settimeout(", "setTimeout"),
-            ("setinterval(", "setInterval"),
-            ("location.hash", "location.hash"),
-            ("location.search", "location.search"),
-            ("document.location", "document.location"),
-            ("document.url", "document.URL"),
-            ("window.name", "window.name"),
-        ]:
+        for needle, label in sinks:
             if needle in text_l:
                 indicators.add(label)
 
@@ -633,47 +793,57 @@ def check_xss_indicators(domain, *, session=None, show_progress=True, return_det
             indicators.add("inline_event_handlers")
 
         try:
-            soup = BeautifulSoup(text, "html.parser")
+            soup = BeautifulSoup(html, "html.parser")
             inline_script_count = 0
             for s in soup.find_all("script"):
-                if not s.get("src"):
-                    content = (s.string or "").strip()
-                    if content:
-                        inline_script_count += 1
+                src = (s.get("src") or "").strip()
+                if src:
+                    script_urls.update(extract_script_srcs(html, page_url, base_host))
+                    continue
+                content = (s.string or "").strip()
+                if content:
+                    inline_script_count += 1
             if inline_script_count:
                 indicators.add(f"inline_scripts:{inline_script_count}")
         except Exception:
             pass
 
         if indicators:
-            add_finding(r.url, indicators)
+            add_finding(page_url, indicators)
 
-        links = extract_internal_links(text, r.url, base_host)
-        return links, None
+        for js in extract_script_srcs(html, page_url, base_host):
+            script_urls.add(js)
 
-    if show_progress:
-        with Progress() as progress:
-            task = progress.add_task("[cyan]Scanning XSS indicators...", total=MAX_CRAWL_PAGES)
-            while queue and len(visited) < MAX_CRAWL_PAGES:
-                url = queue.pop(0)
-                if url in visited:
-                    continue
-                visited.add(url)
-                links, _ = analyze_html(url)
-                for link in links:
-                    if link not in visited and link not in queue and (len(visited) + len(queue)) < MAX_CRAWL_PAGES:
-                        queue.append(link)
-                progress.advance(task)
-    else:
-        while queue and len(visited) < MAX_CRAWL_PAGES:
-            url = queue.pop(0)
-            if url in visited:
-                continue
-            visited.add(url)
-            links, _ = analyze_html(url)
-            for link in links:
-                if link not in visited and link not in queue and (len(visited) + len(queue)) < MAX_CRAWL_PAGES:
-                    queue.append(link)
+    if script_urls:
+        js_list = list(script_urls)[:MAX_JS_FILES]
+        sink_map = [(n, f"js:{lbl}") for n, lbl in sinks]
+
+        if show_progress:
+            with Progress() as progress:
+                task = progress.add_task("[cyan]Analyzing JS for DOM sinks...", total=len(js_list))
+                for js_url in js_list:
+                    progress.update(task, description=f"[cyan]JS XSS scan:[/cyan] {js_url}")
+                    r, _ = safe_request(session, "GET", js_url, timeout=DEFAULT_TIMEOUT)
+                    if r is not None and r.status_code == 200:
+                        text = (r.text or "").lower()
+                        js_ind = set()
+                        for needle, label in sink_map:
+                            if needle in text:
+                                js_ind.add(label)
+                        if js_ind:
+                            add_finding(js_url, js_ind)
+                    progress.advance(task)
+        else:
+            for js_url in js_list:
+                r, _ = safe_request(session, "GET", js_url, timeout=DEFAULT_TIMEOUT)
+                if r is not None and r.status_code == 200:
+                    text = (r.text or "").lower()
+                    js_ind = set()
+                    for needle, label in sink_map:
+                        if needle in text:
+                            js_ind.add(label)
+                    if js_ind:
+                        add_finding(js_url, js_ind)
 
     if findings:
         if not return_details:
@@ -717,7 +887,11 @@ def check_xss_indicators(domain, *, session=None, show_progress=True, return_det
                         count = 0
                     url_score += min(20, count * 3)
                     continue
-                url_score += weights.get(ind, 5)
+                if ind.startswith("js:"):
+                    base = ind.split(":", 1)[1]
+                    url_score += weights.get(base, 5)
+                else:
+                    url_score += weights.get(ind, 5)
 
             url_score = clamp_score(min(90, url_score))
             max_score = max(max_score, url_score)
@@ -817,10 +991,32 @@ def check_directory_listing(domain, *, session=None, show_progress=True, return_
     if not sitemaps:
         sitemaps = {build_url(domain, "/sitemap.xml")}
     for sm in list(sitemaps)[:3]:
-        for u in fetch_sitemap_urls(session, sm, limit=150):
+        for u in fetch_sitemap_urls_recursive(session, sm, url_limit=180, sitemap_limit=6):
             p = urlparse(u).path or ""
             if p.endswith("/"):
                 paths.append(p)
+
+    pages = get_site_snapshot(domain, session=session, max_pages=min(30, MAX_CRAWL_PAGES), use_cache=True, show_progress=False)
+    derived = set()
+    for page in pages:
+        u = page.get("url") or ""
+        p = urlparse(u).path or ""
+        if not p.startswith("/"):
+            continue
+        parts = [x for x in p.split("/") if x]
+        acc = ""
+        for seg in parts[:-1]:
+            acc += f"/{seg}"
+            derived.add(acc + "/")
+            if len(derived) >= 200:
+                break
+        if p.endswith("/"):
+            derived.add(p)
+        if len(derived) >= 200:
+            break
+
+    for d in derived:
+        paths.append(d)
 
     paths = sorted(set(paths))
 
@@ -892,6 +1088,30 @@ def check_backup_files(domain, *, session=None, show_progress=True, return_detai
         if base:
             for tail in ["", ".zip", ".tar.gz", ".sql", ".bak", ".old"]:
                 backups.append(f"{base}{tail}")
+
+    pages = get_site_snapshot(domain, session=session, max_pages=min(25, MAX_CRAWL_PAGES), use_cache=True, show_progress=False)
+    dirs = set()
+    for page in pages:
+        u = page.get("url") or ""
+        p = urlparse(u).path or ""
+        if not p.startswith("/"):
+            continue
+        parts = [x for x in p.split("/") if x]
+        acc = ""
+        for seg in parts[:-1]:
+            acc += f"/{seg}"
+            dirs.add(acc + "/")
+            if len(dirs) >= 60:
+                break
+        if len(dirs) >= 60:
+            break
+
+    for d in dirs:
+        backups.append(d + "backup.zip")
+        backups.append(d + "site.zip")
+        backups.append(d + "www.zip")
+        backups.append(d + "db.sql")
+        backups.append(d + "database.sql")
 
     backups = sorted(set(backups))
 
@@ -1092,39 +1312,66 @@ def fingerprint_cms(domain, *, session=None, return_details=False):
         console.print("[cyan][*][/cyan] CMS Fingerprinting")
 
     try:
-        r, err = safe_request(session, "GET", domain, timeout=DEFAULT_TIMEOUT)
-        if r is None:
-            raise RuntimeError(err or "request failed")
+        pages = get_site_snapshot(domain, session=session, max_pages=min(15, MAX_CRAWL_PAGES), use_cache=True, show_progress=False)
+        if not pages:
+            r, err = safe_request(session, "GET", domain, timeout=DEFAULT_TIMEOUT)
+            if r is None:
+                raise RuntimeError(err or "request failed")
+            pages = [{"url": r.url, "html": r.text or "", "headers": dict(r.headers) if r.headers else {}}]
 
-        text = (r.text or "").lower()
-        headers = {k.lower(): v for k, v in (r.headers or {}).items()}
+        detected = None
+        detail = ""
+        for page in pages:
+            text = (page.get("html") or "").lower()
+            headers = {k.lower(): v for k, v in (page.get("headers") or {}).items()}
 
-        if "wp-content" in text:
+            if "wp-content" in text or "wp-includes" in text or "wp-json" in text:
+                detected = "WordPress"
+                detail = "WordPress indicators"
+                break
+            if "joomla" in text or "com_content" in text:
+                detected = "Joomla"
+                detail = "Joomla indicators"
+                break
+            if "drupal" in text or "sites/all" in text or "sites/default" in text:
+                detected = "Drupal"
+                detail = "Drupal indicators"
+                break
+            if "x-drupal-cache" in headers or "x-generator" in headers and "drupal" in (headers.get("x-generator") or "").lower():
+                detected = "Drupal"
+                detail = "Drupal header indicators"
+                break
+            if "x-powered-by" in headers and headers["x-powered-by"]:
+                detected = "PoweredBy"
+                detail = f"X-Powered-By: {headers['x-powered-by']}"
+                break
+
+        if detected == "WordPress":
             if not return_details:
                 console.print("[yellow]Possible WordPress detected[/yellow]")
             if return_details:
-                return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": "WordPress indicators"}]}
+                return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": detail or "WordPress indicators"}]}
             return True
 
-        elif "joomla" in text:
+        elif detected == "Joomla":
             if not return_details:
                 console.print("[yellow]Possible Joomla detected[/yellow]")
             if return_details:
-                return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": "Joomla indicators"}]}
+                return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": detail or "Joomla indicators"}]}
             return True
 
-        elif "drupal" in text:
+        elif detected == "Drupal":
             if not return_details:
                 console.print("[yellow]Possible Drupal detected[/yellow]")
             if return_details:
-                return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": "Drupal indicators"}]}
+                return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": detail or "Drupal indicators"}]}
             return True
 
-        if "x-powered-by" in headers and headers["x-powered-by"]:
+        if detected == "PoweredBy":
             if not return_details:
-                console.print(f"[green]X-Powered-By:[/green] {headers['x-powered-by']}")
+                console.print(f"[green]{detail}[/green]")
             if return_details:
-                return {"score": 5, "findings": [{"module": "CMS", "url": domain, "score": 5, "risk": risk_label(5), "detail": f"X-Powered-By: {headers['x-powered-by']}"}]}
+                return {"score": 5, "findings": [{"module": "CMS", "url": domain, "score": 5, "risk": risk_label(5), "detail": detail}]}
             return True
 
         if not return_details:
@@ -1143,26 +1390,47 @@ def check_git_exposure(domain, *, session=None, return_details=False):
         return {"score": 0, "findings": []} if return_details else False
 
     session = session or get_http_session()
-    try:
-        url = build_url(domain, "/.git/")
-        r, _ = try_head_then_get(session, url, timeout=DEFAULT_TIMEOUT)
+    targets = [
+        "/.git/",
+        "/.git/HEAD",
+        "/.git/config",
+        "/.git/index",
+        "/.git/description",
+        "/.git/logs/HEAD",
+    ]
 
-        if r is not None and r.status_code == 200:
-            if not return_details:
-                console.print(f"[red]Potential .git exposure: {r.url}[/red]")
-                console.print(f"[bold]Score:[/bold] 95/100 ({risk_label(95)})")
-            if return_details:
-                score = 95
-                return {"score": score, "findings": [{"module": "Git Exposure", "url": r.url, "score": score, "risk": risk_label(score), "detail": "Public .git endpoint"}]}
-            return True
-        else:
-            if not return_details:
-                console.print("[green]No public .git exposure[/green]")
-            return {"score": 0, "findings": []} if return_details else False
+    hits = []
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(targets))) as ex:
+        futures = []
+        for p in targets:
+            futures.append(ex.submit(try_head_then_get, session, build_url(domain, p), timeout=DEFAULT_TIMEOUT))
+        for fut in as_completed(futures):
+            r, _ = fut.result()
+            if r is not None and r.status_code == 200:
+                hits.append(r.url)
 
-    except Exception as e:
-        console.print(f"[red]{e}[/red]")
+    if not hits:
+        if not return_details:
+            console.print("[green]No public .git exposure[/green]")
         return {"score": 0, "findings": []} if return_details else False
+
+    hits = sorted(set(hits))
+    score = 95
+    if not return_details:
+        table = make_table("Public Git Exposure")
+        add_url_column(table, "URL", style="red", ratio=6)
+        for u in hits[:50]:
+            table.add_row(u)
+        console.print(table)
+        console.print(f"[bold]Score:[/bold] {score}/100 ({risk_label(score)})")
+
+    if return_details:
+        findings = []
+        for u in hits:
+            findings.append({"module": "Git Exposure", "url": u, "score": score, "risk": risk_label(score), "detail": "Public .git resource"})
+        return {"score": score, "findings": findings}
+
+    return True
 
 
 def audit_domain(domain):
@@ -1260,20 +1528,33 @@ def check_missing_security_headers(domain, *, session=None, return_details=False
         console.print("[red]Invalid domain[/red]")
         return {"score": 0, "findings": []} if return_details else False
 
-    console.print("[cyan][*][/cyan] Checking missing security headers")
-
     session = session or get_http_session()
-    try:
-        r, err = try_head_then_get(session, domain, timeout=DEFAULT_TIMEOUT)
+    if not return_details:
+        console.print("[cyan][*][/cyan] Checking missing security headers")
+
+    pages = get_site_snapshot(domain, session=session, max_pages=min(20, MAX_CRAWL_PAGES), use_cache=True, show_progress=False)
+    sample_urls = []
+    for p in pages:
+        u = p.get("url")
+        if u:
+            sample_urls.append(u)
+        if len(sample_urls) >= 10:
+            break
+    if domain not in sample_urls:
+        sample_urls.insert(0, domain)
+        sample_urls = sample_urls[:10]
+
+    headers_by_url = {}
+    for u in sample_urls:
+        r, err = try_head_then_get(session, u, timeout=DEFAULT_TIMEOUT)
         if r is None:
-            raise RuntimeError(err or "request failed")
-    except Exception as e:
-        console.print(f"[red]Connection failed:[/red] {e}")
-        return {"score": 0, "findings": []} if return_details else False
+            headers_by_url[u] = {"__error__": err or "request failed"}
+        else:
+            headers_by_url[u] = dict(r.headers) if r.headers else {}
 
     table = make_table("Missing Security Headers")
     add_text_column(table, "Header", style="yellow", ratio=2)
-    add_text_column(table, "Status", style="green", ratio=1)
+    add_text_column(table, "Coverage", style="green", ratio=2)
 
     missing = 0
     findings = []
@@ -1282,22 +1563,38 @@ def check_missing_security_headers(domain, *, session=None, return_details=False
         "Strict-Transport-Security": 25,
         "X-Frame-Options": 10,
         "X-Content-Type-Options": 10,
+        "Referrer-Policy": 10,
+        "Permissions-Policy": 10,
     }
 
     for header in SECURITY_HEADERS:
-        if header in r.headers:
-            table.add_row(header, "Present")
-        else:
-            table.add_row(header, "Missing")
-            missing += 1
-            score = clamp_score(weights.get(header, 5))
-            findings.append({
-                "module": "Missing Headers",
-                "url": domain,
-                "score": score,
-                "risk": risk_label(score),
-                "detail": f"Missing: {header}"
-            })
+        present = 0
+        total = 0
+        for _, hdrs in headers_by_url.items():
+            if "__error__" in hdrs:
+                continue
+            total += 1
+            if header in hdrs:
+                present += 1
+
+        if total == 0:
+            table.add_row(header, "n/a (request errors)")
+            continue
+
+        if present == total:
+            table.add_row(header, f"Present ({present}/{total})")
+            continue
+
+        table.add_row(header, f"Missing ({present}/{total})")
+        missing += 1
+        score = clamp_score(weights.get(header, 5))
+        findings.append({
+            "module": "Missing Headers",
+            "url": domain,
+            "score": score,
+            "risk": risk_label(score),
+            "detail": f"Missing on {total - present}/{total} sampled page(s): {header}"
+        })
 
     if not return_details:
         console.print(table)
@@ -1374,83 +1671,26 @@ def check_upload_misconfig(domain, *, session=None, show_progress=True, return_d
     if found and upload_table is not None:
         console.print(upload_table)
 
-    disallows, sitemaps = fetch_robots_paths(session, domain)
-    if not sitemaps:
-        sitemaps = {build_url(domain, "/sitemap.xml")}
-
-    seed_urls = [domain]
-    for p in sorted(disallows)[:50]:
-        if p.startswith("/"):
-            seed_urls.append(build_url(domain, p))
-
-    for sm in list(sitemaps)[:3]:
-        for u in fetch_sitemap_urls(session, sm, limit=120):
-            host = parse_hostname(u)
-            if host and host == urlparse(domain).netloc:
-                seed_urls.append(u)
-
-    queue = []
-    seen = set()
-    for u in seed_urls:
-        if u and u not in seen:
-            queue.append(u)
-            seen.add(u)
-
-    visited = set()
     all_file_forms = []
-
-    def analyze_page(url):
-        rr, _ = safe_request(session, "GET", url, timeout=DEFAULT_TIMEOUT)
-        if rr is None or rr.status_code not in [200, 301, 302, 403]:
-            return set()
-
-        if not is_probably_html_response(rr):
-            return set()
-
-        html = rr.text or ""
-        links = extract_internal_links(html, rr.url, urlparse(domain).netloc)
-
+    pages = get_site_snapshot(domain, session=session, max_pages=MAX_CRAWL_PAGES, use_cache=True, show_progress=show_progress)
+    for page in pages:
+        page_url = page.get("url") or domain
+        html = page.get("html") or ""
+        if not html:
+            continue
         try:
             soup = BeautifulSoup(html, "html.parser")
             for form in soup.find_all("form"):
                 file_inputs = form.find_all("input", attrs={"type": re.compile(r"^file$", re.I)})
                 if not file_inputs:
                     continue
-
                 action = (form.get("action") or "").strip()
                 method = (form.get("method") or "GET").upper()
                 enctype = (form.get("enctype") or "unknown").lower()
-                action_url = urljoin(rr.url.rstrip("/") + "/", action) if action else rr.url
-
+                action_url = urljoin(page_url.rstrip("/") + "/", action) if action else page_url
                 all_file_forms.append((action_url, method, enctype))
         except Exception:
             pass
-
-        return links
-
-    if show_progress:
-        with Progress() as progress:
-            task = progress.add_task("[cyan]Searching upload forms...", total=MAX_CRAWL_PAGES)
-            while queue and len(visited) < MAX_CRAWL_PAGES:
-                url = queue.pop(0)
-                if url in visited:
-                    continue
-                visited.add(url)
-                links = analyze_page(url)
-                for link in links:
-                    if link not in visited and link not in queue and (len(visited) + len(queue)) < MAX_CRAWL_PAGES:
-                        queue.append(link)
-                progress.advance(task)
-    else:
-        while queue and len(visited) < MAX_CRAWL_PAGES:
-            url = queue.pop(0)
-            if url in visited:
-                continue
-            visited.add(url)
-            links = analyze_page(url)
-            for link in links:
-                if link not in visited and link not in queue and (len(visited) + len(queue)) < MAX_CRAWL_PAGES:
-                    queue.append(link)
 
     if all_file_forms:
         for action_url, method, enctype in all_file_forms[:200]:
@@ -1572,9 +1812,7 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
     urls_with_params = {}
     forms_with_params = {}
     error_disclosures = set()
-
-    queue = [domain]
-    visited = set()
+    js_param_hits = {}
 
     def record_params(url, params):
         if not params:
@@ -1596,84 +1834,143 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
         else:
             existing.update(params)
 
-    def scan_page(url):
-        r, err = safe_request(session, "GET", url, timeout=DEFAULT_TIMEOUT)
-        if r is None:
-            return set(), err
+    pages = get_site_snapshot(domain, session=session, max_pages=MAX_CRAWL_PAGES, use_cache=True, show_progress=show_progress)
 
-        if not is_probably_html_response(r):
-            return set(), None
-
-        text = r.text or ""
-        text_l = text.lower()
-        if any(m in text_l for m in error_markers) and (r.status_code >= 500 or urlparse(r.url).query):
-            error_disclosures.add(r.url)
-
-        links = extract_internal_links(text, r.url, base_host)
-
-        try:
-            soup = BeautifulSoup(text, "html.parser")
-
-            for a in soup.find_all("a", href=True):
-                href = (a.get("href") or "").strip()
-                if not href:
-                    continue
-                abs_url = urljoin(r.url.rstrip("/") + "/", href)
-                p = urlparse(abs_url)
-                if p.netloc and p.netloc != base_host:
-                    continue
-                qs = parse_qs(p.query)
-                if not qs:
-                    continue
-                hit_params = [k for k in qs.keys() if k.lower() in suspicious_params]
-                if hit_params:
-                    record_params(abs_url, [h.lower() for h in hit_params])
-
-            for form in soup.find_all("form"):
-                method = (form.get("method") or "GET").upper()
-                action = (form.get("action") or "").strip() or r.url
-                action_url = urljoin(r.url.rstrip("/") + "/", action)
-                ap = urlparse(action_url)
-                if ap.netloc and ap.netloc != base_host:
-                    continue
-
-                names = set()
-                for inp in form.find_all(["input", "select", "textarea"]):
-                    name = inp.get("name")
-                    if name:
-                        names.add(name)
-
-                hit = [n for n in names if n.lower() in suspicious_params]
-                if hit:
-                    record_form(action_url, method, [h.lower() for h in hit])
-        except Exception:
-            pass
-
-        return links, None
+    script_urls = set()
+    param_pattern = re.compile(r"[?&]([a-zA-Z0-9_]{1,30})=")
 
     if show_progress:
         with Progress() as progress:
-            task = progress.add_task("[cyan]Crawling pages...", total=MAX_CRAWL_PAGES)
-            while queue and len(visited) < MAX_CRAWL_PAGES:
-                url = queue.pop(0)
-                if url in visited:
-                    continue
-                visited.add(url)
-                links, _ = scan_page(url)
-                for link in links:
-                    if link not in visited and link not in queue and (len(visited) + len(queue)) < MAX_CRAWL_PAGES:
-                        queue.append(link)
+            task = progress.add_task("[cyan]Analyzing pages...", total=max(1, len(pages)))
+            for page in pages:
+                progress.update(task, description=f"[cyan]Analyzing:[/cyan] {page.get('url','')}")
+                html = page.get("html") or ""
+                page_url = page.get("url") or ""
+                if html:
+                    text_l = html.lower()
+                    if any(m in text_l for m in error_markers) and (int(page.get("status") or 0) >= 500 or urlparse(page_url).query):
+                        error_disclosures.add(page_url)
+
+                    try:
+                        soup = BeautifulSoup(html, "html.parser")
+                        for a in soup.find_all("a", href=True):
+                            href = (a.get("href") or "").strip()
+                            if not href:
+                                continue
+                            abs_url = urljoin(page_url.rstrip("/") + "/", href)
+                            p = urlparse(abs_url)
+                            if p.netloc and p.netloc != base_host:
+                                continue
+                            qs = parse_qs(p.query)
+                            if not qs:
+                                continue
+                            hit_params = [k for k in qs.keys() if k.lower() in suspicious_params]
+                            if hit_params:
+                                record_params(abs_url, [h.lower() for h in hit_params])
+
+                        for form in soup.find_all("form"):
+                            method = (form.get("method") or "GET").upper()
+                            action = (form.get("action") or "").strip() or page_url
+                            action_url = urljoin(page_url.rstrip("/") + "/", action)
+                            ap = urlparse(action_url)
+                            if ap.netloc and ap.netloc != base_host:
+                                continue
+
+                            names = set()
+                            for inp in form.find_all(["input", "select", "textarea"]):
+                                name = inp.get("name")
+                                if name:
+                                    names.add(name)
+
+                            hit = [n for n in names if n.lower() in suspicious_params]
+                            if hit:
+                                record_form(action_url, method, [h.lower() for h in hit])
+                    except Exception:
+                        pass
+
+                    for js in extract_script_srcs(html, page_url, base_host):
+                        script_urls.add(js)
+
                 progress.advance(task)
     else:
-        while queue and len(visited) < MAX_CRAWL_PAGES:
-            url = queue.pop(0)
-            if url in visited:
-                continue
-            visited.add(url)
-            links, _ = scan_page(url)
-            for link in links:
-                if link not in visited and link not in queue and (len(visited) + len(queue)) < MAX_CRAWL_PAGES:
-                    queue.append(link)
+        for page in pages:
+            html = page.get("html") or ""
+            page_url = page.get("url") or ""
+            if html:
+                text_l = html.lower()
+                if any(m in text_l for m in error_markers) and (int(page.get("status") or 0) >= 500 or urlparse(page_url).query):
+                    error_disclosures.add(page_url)
+
+                try:
+                    soup = BeautifulSoup(html, "html.parser")
+                    for a in soup.find_all("a", href=True):
+                        href = (a.get("href") or "").strip()
+                        if not href:
+                            continue
+                        abs_url = urljoin(page_url.rstrip("/") + "/", href)
+                        p = urlparse(abs_url)
+                        if p.netloc and p.netloc != base_host:
+                            continue
+                        qs = parse_qs(p.query)
+                        if not qs:
+                            continue
+                        hit_params = [k for k in qs.keys() if k.lower() in suspicious_params]
+                        if hit_params:
+                            record_params(abs_url, [h.lower() for h in hit_params])
+
+                    for form in soup.find_all("form"):
+                        method = (form.get("method") or "GET").upper()
+                        action = (form.get("action") or "").strip() or page_url
+                        action_url = urljoin(page_url.rstrip("/") + "/", action)
+                        ap = urlparse(action_url)
+                        if ap.netloc and ap.netloc != base_host:
+                            continue
+
+                        names = set()
+                        for inp in form.find_all(["input", "select", "textarea"]):
+                            name = inp.get("name")
+                            if name:
+                                names.add(name)
+
+                        hit = [n for n in names if n.lower() in suspicious_params]
+                        if hit:
+                            record_form(action_url, method, [h.lower() for h in hit])
+                except Exception:
+                    pass
+
+                for js in extract_script_srcs(html, page_url, base_host):
+                    script_urls.add(js)
+
+    if script_urls:
+        js_list = list(script_urls)[:MAX_JS_FILES]
+        if show_progress:
+            with Progress() as progress:
+                task = progress.add_task("[cyan]Analyzing JS sources...", total=len(js_list))
+                for js_url in js_list:
+                    progress.update(task, description=f"[cyan]JS:[/cyan] {js_url}")
+                    rr, _ = safe_request(session, "GET", js_url, timeout=DEFAULT_TIMEOUT)
+                    if rr is not None and rr.status_code == 200:
+                        text = rr.text or ""
+                        hits = set()
+                        for m in param_pattern.findall(text):
+                            k = m.lower()
+                            if k in suspicious_params:
+                                hits.add(k)
+                        if hits:
+                            js_param_hits[js_url] = hits
+                    progress.advance(task)
+        else:
+            for js_url in js_list:
+                rr, _ = safe_request(session, "GET", js_url, timeout=DEFAULT_TIMEOUT)
+                if rr is not None and rr.status_code == 200:
+                    text = rr.text or ""
+                    hits = set()
+                    for m in param_pattern.findall(text):
+                        k = m.lower()
+                        if k in suspicious_params:
+                            hits.add(k)
+                    if hits:
+                        js_param_hits[js_url] = hits
 
     found_any = False
 
@@ -1708,10 +2005,21 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
             console.print(table)
         found_any = True
 
+    if js_param_hits:
+        if not return_details:
+            table = make_table("Potential SQLi Parameters (from JS)")
+            add_url_column(table, "JS URL", style="cyan", ratio=6)
+            add_text_column(table, "Parameter(s)", style="red", ratio=2)
+            for u in sorted(js_param_hits.keys())[:50]:
+                params = ", ".join(sorted(js_param_hits[u]))
+                table.add_row(u, params)
+            console.print(table)
+        found_any = True
+
     if found_any:
         if not return_details:
             console.print("[yellow]Found potential SQLi indicators (no exploitation attempted)[/yellow]")
-            score = 85 if error_disclosures else (35 if urls_with_params else (30 if forms_with_params else 0))
+            score = 85 if error_disclosures else (35 if (urls_with_params or js_param_hits) else (30 if forms_with_params else 0))
             console.print(f"[bold]Score:[/bold] {score}/100 ({risk_label(score)})")
 
         if return_details:
@@ -1749,6 +2057,17 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
                     "score": score,
                     "risk": risk_label(score),
                     "detail": f"Params: {', '.join(sorted(forms_with_params[k]))}"
+                })
+
+            for u in sorted(js_param_hits.keys()):
+                score = 25
+                max_score = max(max_score, score)
+                findings.append({
+                    "module": "SQLi Indicators",
+                    "url": u,
+                    "score": score,
+                    "risk": risk_label(score),
+                    "detail": f"JS params: {', '.join(sorted(js_param_hits[u]))}"
                 })
 
             return {"score": max_score, "findings": findings}
