@@ -475,6 +475,26 @@ def extract_script_srcs(html, base_url, base_host):
     return urls
 
 
+def extract_hostnames_from_text(text):
+    if not text:
+        return set()
+
+    hostnames = set()
+    patterns = [
+        re.compile(r"https?://([a-z0-9.-]+\.[a-z]{2,})(?::\d+)?", re.I),
+        re.compile(r"(?<!:)//([a-z0-9.-]+\.[a-z]{2,})(?::\d+)?", re.I),
+        re.compile(r"(?<!@)\b([a-z0-9][a-z0-9-]{0,61}(?:\.[a-z0-9][a-z0-9-]{0,61})+\.[a-z]{2,})\b", re.I),
+    ]
+
+    for pat in patterns:
+        for m in pat.findall(text):
+            host = (m or "").strip(".").lower()
+            if host:
+                hostnames.add(host)
+
+    return hostnames
+
+
 def get_site_snapshot(domain, *, session=None, max_pages=MAX_CRAWL_PAGES, use_cache=True, show_progress=True):
     domain = normalize_domain(domain)
     if not domain:
@@ -592,11 +612,24 @@ def discover_subdomain_references(domain, *, session=None, show_progress=True, r
         else:
             existing.add(source_url)
 
-    host_pattern = re.compile(r"https?://([a-z0-9.-]+\.[a-z]{2,})", re.I)
-
     pages = get_site_snapshot(domain, session=session, max_pages=MAX_CRAWL_PAGES, use_cache=True, show_progress=show_progress)
 
     script_urls = set()
+    disallows, sitemaps = fetch_robots_paths(session, domain)
+    if not sitemaps:
+        sitemaps = {build_url(domain, "/sitemap.xml")}
+
+    for sm in list(sitemaps)[:3]:
+        for u in fetch_sitemap_urls_recursive(
+            session,
+            sm,
+            url_limit=MAX_SITEMAP_URLS,
+            sitemap_limit=min(6, MAX_SITEMAP_FILES),
+        ):
+            host = parse_hostname(u)
+            if host and host.endswith("." + base_domain):
+                record(host, sm)
+
     for page in pages:
         page_url = page.get("url") or domain
         html = page.get("html") or ""
@@ -605,14 +638,14 @@ def discover_subdomain_references(domain, *, session=None, show_progress=True, r
         for v in headers.values():
             if not isinstance(v, str):
                 continue
-            for m in host_pattern.findall(v):
-                record(m, page_url)
+            for h in extract_hostnames_from_text(v):
+                record(h, page_url)
 
         if not html:
             continue
 
-        for m in host_pattern.findall(html):
-            record(m, page_url)
+        for h in extract_hostnames_from_text(html):
+            record(h, page_url)
 
         try:
             soup = BeautifulSoup(html, "html.parser")
@@ -624,6 +657,8 @@ def discover_subdomain_references(domain, *, session=None, show_progress=True, r
                     host = parse_hostname(v)
                     if host:
                         record(host, page_url)
+                    for h in extract_hostnames_from_text(v):
+                        record(h, page_url)
         except Exception:
             pass
 
@@ -640,16 +675,16 @@ def discover_subdomain_references(domain, *, session=None, show_progress=True, r
                     r, _ = safe_request(session, "GET", js_url, timeout=DEFAULT_TIMEOUT)
                     if r is not None and r.status_code == 200:
                         text = r.text or ""
-                        for m in host_pattern.findall(text):
-                            record(m, js_url)
+                        for h in extract_hostnames_from_text(text):
+                            record(h, js_url)
                     progress.advance(task)
         else:
             for js_url in js_list:
                 r, _ = safe_request(session, "GET", js_url, timeout=DEFAULT_TIMEOUT)
                 if r is not None and r.status_code == 200:
                     text = r.text or ""
-                    for m in host_pattern.findall(text):
-                        record(m, js_url)
+                    for h in extract_hostnames_from_text(text):
+                        record(h, js_url)
 
     if not found:
         if not return_details:
@@ -1813,6 +1848,8 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
     forms_with_params = {}
     error_disclosures = set()
     js_param_hits = {}
+    discovered_params = {}
+    hidden_params = {}
 
     def record_params(url, params):
         if not params:
@@ -1838,6 +1875,9 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
 
     script_urls = set()
     param_pattern = re.compile(r"[?&]([a-zA-Z0-9_]{1,30})=")
+    js_get_pattern = re.compile(r"\.get\(\s*['\"]([a-zA-Z0-9_]{1,30})['\"]\s*\)")
+    js_getparam_pattern = re.compile(r"getParameterByName\(\s*['\"]([a-zA-Z0-9_]{1,30})['\"]\s*\)")
+    js_qs_pattern = re.compile(r"(https?://[^\s\"']+|/[^\s\"']+)\?([^\s\"']+)")
 
     if show_progress:
         with Progress() as progress:
@@ -1864,6 +1904,8 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
                             qs = parse_qs(p.query)
                             if not qs:
                                 continue
+                            for k in qs.keys():
+                                discovered_params.setdefault(k.lower(), set()).add("url")
                             hit_params = [k for k in qs.keys() if k.lower() in suspicious_params]
                             if hit_params:
                                 record_params(abs_url, [h.lower() for h in hit_params])
@@ -1881,7 +1923,12 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
                                 name = inp.get("name")
                                 if name:
                                     names.add(name)
+                                itype = (inp.get("type") or "").strip().lower()
+                                if itype == "hidden" and name:
+                                    hidden_params.setdefault(name.lower(), set()).add(f"{method} {action_url}")
 
+                            for n in names:
+                                discovered_params.setdefault(n.lower(), set()).add("form")
                             hit = [n for n in names if n.lower() in suspicious_params]
                             if hit:
                                 record_form(action_url, method, [h.lower() for h in hit])
@@ -1956,6 +2003,16 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
                             k = m.lower()
                             if k in suspicious_params:
                                 hits.add(k)
+                            discovered_params.setdefault(k, set()).add("js")
+                        for m in js_get_pattern.findall(text):
+                            discovered_params.setdefault(m.lower(), set()).add("js")
+                        for m in js_getparam_pattern.findall(text):
+                            discovered_params.setdefault(m.lower(), set()).add("js")
+                        for _, qs in js_qs_pattern.findall(text):
+                            for part in qs.split("&")[:50]:
+                                key = part.split("=", 1)[0].strip().lower()
+                                if key and re.fullmatch(r"[a-z0-9_]{1,30}", key):
+                                    discovered_params.setdefault(key, set()).add("js")
                         if hits:
                             js_param_hits[js_url] = hits
                     progress.advance(task)
@@ -1969,6 +2026,16 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
                         k = m.lower()
                         if k in suspicious_params:
                             hits.add(k)
+                        discovered_params.setdefault(k, set()).add("js")
+                    for m in js_get_pattern.findall(text):
+                        discovered_params.setdefault(m.lower(), set()).add("js")
+                    for m in js_getparam_pattern.findall(text):
+                        discovered_params.setdefault(m.lower(), set()).add("js")
+                    for _, qs in js_qs_pattern.findall(text):
+                        for part in qs.split("&")[:50]:
+                            key = part.split("=", 1)[0].strip().lower()
+                            if key and re.fullmatch(r"[a-z0-9_]{1,30}", key):
+                                discovered_params.setdefault(key, set()).add("js")
                     if hits:
                         js_param_hits[js_url] = hits
 
@@ -2015,6 +2082,32 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
                 table.add_row(u, params)
             console.print(table)
         found_any = True
+
+    if hidden_params:
+        if not return_details:
+            table = make_table("Hidden Parameters (from Forms)")
+            add_text_column(table, "Parameter", style="yellow", ratio=2)
+            add_text_column(table, "Form(s)", style="cyan", ratio=6)
+            for p in sorted(hidden_params.keys())[:60]:
+                forms = sorted(list(hidden_params[p]))[:3]
+                suffix = "" if len(hidden_params[p]) <= 3 else f" (+{len(hidden_params[p]) - 3})"
+                table.add_row(p, " | ".join(forms) + suffix)
+            console.print(table)
+
+    if discovered_params and not return_details:
+        table = make_table("Discovered Parameters (All Sources)")
+        add_text_column(table, "Parameter", style="yellow", ratio=2)
+        add_text_column(table, "Source", style="green", ratio=1)
+        add_text_column(table, "Flags", style="red", ratio=2)
+        for p in sorted(discovered_params.keys())[:120]:
+            sources = ",".join(sorted(discovered_params[p]))
+            flags = []
+            if p in suspicious_params:
+                flags.append("suspicious")
+            if p in hidden_params:
+                flags.append("hidden")
+            table.add_row(p, sources, ",".join(flags) or "-")
+        console.print(table)
 
     if found_any:
         if not return_details:
