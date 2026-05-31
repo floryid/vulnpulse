@@ -16,6 +16,22 @@ Real-time Defensive Web Audit Toolkit (passive scanning) + Webshell hygiene util
 - Python packages:
   - `rich` `requests` `beautifulsoup4`
 
+### Clone
+
+Linux / Termux:
+
+```bash
+git clone https://github.com/floryid/vulnpulse.git
+cd vulnpulse
+```
+
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/floryid/vulnpulse.git
+cd vulnpulse
+```
+
 ### Install (Linux)
 
 Recommended (virtual environment):
@@ -23,6 +39,14 @@ Recommended (virtual environment):
 ```bash
 python3 -m venv venv
 source venv/bin/activate
+pip install rich requests beautifulsoup4
+```
+
+### Install (Termux)
+
+```bash
+pkg update
+pkg install python git
 pip install rich requests beautifulsoup4
 ```
 
