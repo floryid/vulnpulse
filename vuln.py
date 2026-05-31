@@ -21,7 +21,7 @@ Features:
 - Multi-threaded scanning
 
 Usage:
-    python3 webshell.py
+    python3 vuln.py
 
 Requirements:
     pip install rich requests beautifulsoup4

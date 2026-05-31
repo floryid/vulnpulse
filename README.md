@@ -27,7 +27,7 @@ pip install rich requests beautifulsoup4
 ### Run
 
 ```bash
-python webshell.py
+python vuln.py
 ```
 
 ## Usage
@@ -86,7 +86,7 @@ This tool is designed for **defensive auditing** and **authorized environments o
 
 ## Project Structure
 
-- `webshell.py` — main entry point (interactive menu + scanners)
+- `vuln.py` — main entry point (interactive menu + scanners)
 
 ## Deploy to GitHub
 
