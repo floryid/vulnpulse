@@ -35,6 +35,8 @@ import math
 import shutil
 import hashlib
 import threading
+import ipaddress
+import xml.etree.ElementTree as ET
 from queue import Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -48,7 +50,7 @@ from rich.progress import Progress
 from rich.layout import Layout
 from rich.text import Text
 
-console = Console()
+console = Console(soft_wrap=True)
 
 # =========================================================
 # SAFE DOMAIN SECURITY AUDIT
@@ -69,23 +71,95 @@ VULN_SCAN_MODULES = {
     "8": "CMS Fingerprint",
     "9": "Public Git Exposure",
     "10": "HTTP Method Misconfiguration",
-    "11": "XSS Indicators (DOM/HTML)"
+    "11": "XSS Indicators (DOM/HTML)",
+    "12": "Subdomain Discovery (Passive)"
 }
 
 COMMON_UPLOAD_PATHS = [
     "/upload",
     "/uploads",
     "/file-upload",
+    "/fileupload",
+    "/upload-file",
+    "/uploader",
+    "/upload.php",
+    "/upload.jsp",
+    "/upload.aspx",
     "/admin/upload",
     "/media/upload",
-    "/api/upload"
+    "/api/upload",
+    "/api/v1/upload",
+    "/api/v2/upload"
 ]
 
 SECURITY_HEADERS = [
     "Content-Security-Policy",
     "X-Frame-Options",
     "X-Content-Type-Options",
-    "Strict-Transport-Security"
+    "Strict-Transport-Security",
+    "Referrer-Policy",
+    "Permissions-Policy",
+    "Cross-Origin-Opener-Policy",
+    "Cross-Origin-Resource-Policy",
+    "Cross-Origin-Embedder-Policy"
+]
+
+DIRECTORY_LISTING_PATHS = [
+    "/uploads/",
+    "/images/",
+    "/backup/",
+    "/files/",
+    "/assets/",
+    "/media/",
+    "/static/",
+    "/public/",
+]
+
+BACKUP_FILE_PATHS = [
+    "/backup.zip",
+    "/website.zip",
+    "/www.zip",
+    "/site.zip",
+    "/public_html.zip",
+    "/backup.tar.gz",
+    "/backup.tar",
+    "/backup.tgz",
+    "/backup.sql",
+    "/db.sql",
+    "/dump.sql",
+    "/database.sql",
+    "/db.sql.gz",
+]
+
+ADMIN_PANEL_PATHS = [
+    "/admin",
+    "/admin/",
+    "/admin/login",
+    "/admin/login.php",
+    "/administrator",
+    "/administrator/",
+    "/login",
+    "/login.php",
+    "/wp-admin",
+    "/wp-login.php",
+    "/cpanel",
+]
+
+SENSITIVE_FILE_PATHS = [
+    "/.env",
+    "/.env.example",
+    "/.env.local",
+    "/.git/config",
+    "/.git/HEAD",
+    "/composer.json",
+    "/composer.lock",
+    "/package.json",
+    "/package-lock.json",
+    "/yarn.lock",
+    "/pnpm-lock.yaml",
+    "/config.php.bak",
+    "/config.php~",
+    "/wp-config.php~",
 ]
 
 DEFAULT_TIMEOUT = (5, 15)
@@ -212,6 +286,244 @@ def extract_internal_links(html, base_url, base_host):
     return links
 
 
+def parse_hostname(value):
+    try:
+        p = urlparse(value)
+        host = p.netloc or p.path
+        host = host.split("@")[-1]
+        host = host.split(":")[0].strip().lower()
+        if not host:
+            return ""
+        ipaddress.ip_address(host)
+        return ""
+    except Exception:
+        return host
+
+
+def base_domain_from_host(host):
+    host = (host or "").strip(".").lower()
+    if not host or host.count(".") < 1:
+        return host
+
+    parts = host.split(".")
+    if len(parts) < 2:
+        return host
+
+    sld_exceptions = {
+        "co.id",
+        "ac.id",
+        "sch.id",
+        "go.id",
+        "or.id",
+        "web.id",
+        "co.uk",
+        "org.uk",
+        "gov.uk",
+        "ac.uk",
+    }
+
+    last2 = ".".join(parts[-2:])
+    last3 = ".".join(parts[-3:])
+    if last2 in sld_exceptions and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    if last3 in sld_exceptions and len(parts) >= 4:
+        return ".".join(parts[-4:])
+
+    return last2
+
+
+def fetch_robots_paths(session, domain):
+    domain = normalize_domain(domain)
+    if not domain:
+        return set(), set()
+
+    robots_url = build_url(domain, "/robots.txt")
+    r, _ = safe_request(session, "GET", robots_url, timeout=DEFAULT_TIMEOUT)
+    if r is None or r.status_code not in [200, 301, 302, 403]:
+        return set(), set()
+
+    disallows = set()
+    sitemaps = set()
+    for raw in (r.text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        low = line.lower()
+        if low.startswith("disallow:"):
+            v = line.split(":", 1)[1].strip()
+            if v.startswith("/"):
+                disallows.add(v)
+        elif low.startswith("sitemap:"):
+            v = line.split(":", 1)[1].strip()
+            if v:
+                sitemaps.add(v)
+
+    return disallows, sitemaps
+
+
+def fetch_sitemap_urls(session, sitemap_url, *, limit=300):
+    r, _ = safe_request(session, "GET", sitemap_url, timeout=DEFAULT_TIMEOUT)
+    if r is None or r.status_code != 200:
+        return []
+
+    text = (r.text or "").strip()
+    if not text:
+        return []
+
+    urls = []
+    try:
+        root = ET.fromstring(text)
+        for el in root.iter():
+            tag = el.tag.split("}")[-1].lower()
+            if tag == "loc":
+                loc = (el.text or "").strip()
+                if loc:
+                    urls.append(loc)
+                    if len(urls) >= limit:
+                        break
+    except Exception:
+        return []
+
+    return urls
+
+
+def discover_subdomain_references(domain, *, session=None, show_progress=True, return_details=False):
+    domain = normalize_domain(domain)
+    if not domain:
+        console.print("[red]Invalid domain[/red]")
+        return {"score": 0, "findings": []} if return_details else False
+
+    session = session or get_http_session()
+
+    base_host = urlparse(domain).netloc.lower()
+    base_domain = base_domain_from_host(base_host)
+
+    disallows, sitemaps = fetch_robots_paths(session, domain)
+    if not sitemaps:
+        sitemaps = {build_url(domain, "/sitemap.xml")}
+
+    seed_urls = [domain]
+    for p in sorted(disallows)[:50]:
+        if p.startswith("/"):
+            seed_urls.append(build_url(domain, p))
+
+    for sm in list(sitemaps)[:3]:
+        for u in fetch_sitemap_urls(session, sm, limit=120):
+            host = parse_hostname(u)
+            if host and host == base_host:
+                seed_urls.append(u)
+
+    queue = []
+    visited = set()
+    for u in seed_urls:
+        if u and u not in visited:
+            queue.append(u)
+            visited.add(u)
+
+    found = {}
+
+    def record(host, source_url):
+        host = (host or "").strip(".").lower()
+        if not host or host == base_host:
+            return
+        if not host.endswith("." + base_domain):
+            return
+        existing = found.get(host)
+        if existing is None:
+            found[host] = {source_url}
+        else:
+            existing.add(source_url)
+
+    host_pattern = re.compile(r"https?://([a-z0-9.-]+\.[a-z]{2,})", re.I)
+
+    def analyze(url):
+        r, _ = safe_request(session, "GET", url, timeout=DEFAULT_TIMEOUT)
+        if r is None or r.status_code not in [200, 301, 302, 403]:
+            return set()
+        if not is_probably_html_response(r):
+            return set()
+
+        html = r.text or ""
+        for m in host_pattern.findall(html):
+            record(m, r.url)
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag, attr in [("a", "href"), ("script", "src"), ("img", "src"), ("link", "href")]:
+                for el in soup.find_all(tag):
+                    v = (el.get(attr) or "").strip()
+                    if not v:
+                        continue
+                    host = parse_hostname(v)
+                    if host:
+                        record(host, r.url)
+        except Exception:
+            pass
+
+        links = extract_internal_links(html, r.url, base_host)
+        return links
+
+    crawl_queue = queue[:]
+    seen_pages = set()
+
+    if show_progress:
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Discovering subdomain references...", total=MAX_CRAWL_PAGES)
+            while crawl_queue and len(seen_pages) < MAX_CRAWL_PAGES:
+                u = crawl_queue.pop(0)
+                if u in seen_pages:
+                    continue
+                seen_pages.add(u)
+                links = analyze(u)
+                for link in links:
+                    if link not in seen_pages and link not in crawl_queue and (len(seen_pages) + len(crawl_queue)) < MAX_CRAWL_PAGES:
+                        crawl_queue.append(link)
+                progress.advance(task)
+    else:
+        while crawl_queue and len(seen_pages) < MAX_CRAWL_PAGES:
+            u = crawl_queue.pop(0)
+            if u in seen_pages:
+                continue
+            seen_pages.add(u)
+            links = analyze(u)
+            for link in links:
+                if link not in seen_pages and link not in crawl_queue and (len(seen_pages) + len(crawl_queue)) < MAX_CRAWL_PAGES:
+                    crawl_queue.append(link)
+
+    if not found:
+        if not return_details:
+            console.print("[green]No subdomain references detected[/green]")
+        return {"score": 0, "findings": []} if return_details else False
+
+    items = sorted(found.items(), key=lambda x: (-len(x[1]), x[0]))
+
+    if not return_details:
+        table = make_table("Subdomain References (Passive)")
+        add_text_column(table, "Subdomain", style="yellow", ratio=3)
+        add_text_column(table, "Sources", ratio=1)
+        for host, sources in items[:80]:
+            table.add_row(host, str(len(sources)))
+        console.print(table)
+
+    findings = []
+    max_score = 0
+    for host, sources in items:
+        score = clamp_score(min(35, 10 + (len(sources) * 2)))
+        max_score = max(max_score, score)
+        findings.append({
+            "module": "Subdomain Discovery",
+            "url": host,
+            "score": score,
+            "risk": risk_label(score),
+            "detail": f"Referenced in {len(sources)} page(s)"
+        })
+
+    if not return_details:
+        console.print(f"[bold]Score:[/bold] {max_score}/100 ({risk_label(max_score)})")
+
+    return {"score": max_score, "findings": findings} if return_details else True
+
+
 def risk_label(score):
     if score >= 90:
         return "CRITICAL"
@@ -234,6 +546,21 @@ def clamp_score(value, minimum=0, maximum=100):
     if value > maximum:
         return maximum
     return value
+
+
+def make_table(title):
+    return Table(title=title, expand=True, show_lines=True)
+
+
+def add_url_column(table, header="URL", *, style="cyan", ratio=4):
+    table.add_column(header, style=style, overflow="fold", no_wrap=False, ratio=ratio)
+
+
+def add_text_column(table, header, *, style=None, ratio=1):
+    if style:
+        table.add_column(header, style=style, overflow="fold", no_wrap=False, ratio=ratio)
+    else:
+        table.add_column(header, overflow="fold", no_wrap=False, ratio=ratio)
 
 
 def check_xss_indicators(domain, *, session=None, show_progress=True, return_details=False):
@@ -350,9 +677,9 @@ def check_xss_indicators(domain, *, session=None, show_progress=True, return_det
 
     if findings:
         if not return_details:
-            table = Table(title="XSS Indicators (DOM/HTML)")
-            table.add_column("URL", style="yellow")
-            table.add_column("Indicator(s)", style="red")
+            table = make_table("XSS Indicators (DOM/HTML)")
+            add_url_column(table, "URL", style="cyan", ratio=4)
+            add_text_column(table, "Indicator(s)", style="red", ratio=3)
             for u in sorted(findings.keys())[:50]:
                 table.add_row(u, ", ".join(sorted(findings[u]))[:200])
             console.print(table)
@@ -421,9 +748,9 @@ def check_http_methods(domain, *, session=None, return_details=False):
         return {"score": 0, "findings": []} if return_details else False
 
     session = session or get_http_session()
-    table = Table(title="Dangerous HTTP Methods")
-    table.add_column("Method")
-    table.add_column("Allowed")
+    table = make_table("Dangerous HTTP Methods")
+    add_text_column(table, "Method", ratio=1)
+    add_text_column(table, "Allowed", ratio=1)
 
     risky = False
     risky_methods = []
@@ -482,11 +809,24 @@ def check_directory_listing(domain, *, session=None, show_progress=True, return_
         return {"score": 0, "findings": []} if return_details else False
 
     session = session or get_http_session()
-    paths = ["/uploads/", "/images/", "/backup/", "/files/"]
+    paths = list(DIRECTORY_LISTING_PATHS)
+    disallows, sitemaps = fetch_robots_paths(session, domain)
+    for p in sorted(disallows):
+        if p.endswith("/"):
+            paths.append(p)
+    if not sitemaps:
+        sitemaps = {build_url(domain, "/sitemap.xml")}
+    for sm in list(sitemaps)[:3]:
+        for u in fetch_sitemap_urls(session, sm, limit=150):
+            p = urlparse(u).path or ""
+            if p.endswith("/"):
+                paths.append(p)
 
-    table = Table(title="Directory Listing Check")
-    table.add_column("Path")
-    table.add_column("Status")
+    paths = sorted(set(paths))
+
+    table = make_table("Directory Listing Check")
+    add_url_column(table, "Path", style="cyan", ratio=4)
+    add_text_column(table, "Status", ratio=1)
 
     found = False
     found_urls = []
@@ -545,17 +885,19 @@ def check_backup_files(domain, *, session=None, show_progress=True, return_detai
         return {"score": 0, "findings": []} if return_details else False
 
     session = session or get_http_session()
-    backups = [
-        "/backup.zip",
-        "/website.zip",
-        "/db.sql",
-        "/backup.tar.gz",
-        "/www.zip"
-    ]
+    backups = list(BACKUP_FILE_PATHS)
+    disallows, _ = fetch_robots_paths(session, domain)
+    for p in sorted(disallows):
+        base = p.rstrip("/")
+        if base:
+            for tail in ["", ".zip", ".tar.gz", ".sql", ".bak", ".old"]:
+                backups.append(f"{base}{tail}")
 
-    table = Table(title="Exposed Backup Files")
-    table.add_column("URL")
-    table.add_column("HTTP")
+    backups = sorted(set(backups))
+
+    table = make_table("Exposed Backup Files")
+    add_url_column(table, "URL", style="cyan", ratio=5)
+    add_text_column(table, "HTTP", ratio=1)
 
     found = False
     found_urls = []
@@ -610,11 +952,19 @@ def check_env_files(domain, *, session=None, show_progress=True, return_details=
         return {"score": 0, "findings": []} if return_details else False
 
     session = session or get_http_session()
-    files = ["/.env", "/config.php.bak", "/.git/config"]
+    files = list(SENSITIVE_FILE_PATHS)
+    disallows, _ = fetch_robots_paths(session, domain)
+    for p in sorted(disallows):
+        base = p.rstrip("/")
+        if base:
+            for tail in [".bak", ".old", "~"]:
+                files.append(f"{base}{tail}")
 
-    table = Table(title="Sensitive File Exposure")
-    table.add_column("URL")
-    table.add_column("Status")
+    files = sorted(set(files))
+
+    table = make_table("Sensitive File Exposure")
+    add_url_column(table, "URL", style="cyan", ratio=5)
+    add_text_column(table, "Status", ratio=1)
 
     found = False
     found_urls = []
@@ -669,17 +1019,18 @@ def check_admin_panels(domain, *, session=None, show_progress=True, return_detai
         return {"score": 0, "findings": []} if return_details else False
 
     session = session or get_http_session()
-    panels = [
-        "/admin",
-        "/administrator",
-        "/wp-admin",
-        "/login",
-        "/cpanel"
-    ]
+    panels = list(ADMIN_PANEL_PATHS)
+    disallows, _ = fetch_robots_paths(session, domain)
+    for p in sorted(disallows):
+        low = p.lower()
+        if "admin" in low or "login" in low or "panel" in low:
+            panels.append(p)
 
-    table = Table(title="Admin Panel Discovery")
-    table.add_column("Panel")
-    table.add_column("HTTP")
+    panels = sorted(set(panels))
+
+    table = make_table("Admin Panel Discovery")
+    add_url_column(table, "Panel", style="cyan", ratio=5)
+    add_text_column(table, "HTTP", ratio=1)
 
     found = False
     found_panels = []
@@ -749,30 +1100,35 @@ def fingerprint_cms(domain, *, session=None, return_details=False):
         headers = {k.lower(): v for k, v in (r.headers or {}).items()}
 
         if "wp-content" in text:
-            console.print("[yellow]Possible WordPress detected[/yellow]")
+            if not return_details:
+                console.print("[yellow]Possible WordPress detected[/yellow]")
             if return_details:
                 return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": "WordPress indicators"}]}
             return True
 
         elif "joomla" in text:
-            console.print("[yellow]Possible Joomla detected[/yellow]")
+            if not return_details:
+                console.print("[yellow]Possible Joomla detected[/yellow]")
             if return_details:
                 return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": "Joomla indicators"}]}
             return True
 
         elif "drupal" in text:
-            console.print("[yellow]Possible Drupal detected[/yellow]")
+            if not return_details:
+                console.print("[yellow]Possible Drupal detected[/yellow]")
             if return_details:
                 return {"score": 10, "findings": [{"module": "CMS", "url": domain, "score": 10, "risk": risk_label(10), "detail": "Drupal indicators"}]}
             return True
 
         if "x-powered-by" in headers and headers["x-powered-by"]:
-            console.print(f"[green]X-Powered-By:[/green] {headers['x-powered-by']}")
+            if not return_details:
+                console.print(f"[green]X-Powered-By:[/green] {headers['x-powered-by']}")
             if return_details:
                 return {"score": 5, "findings": [{"module": "CMS", "url": domain, "score": 5, "risk": risk_label(5), "detail": f"X-Powered-By: {headers['x-powered-by']}"}]}
             return True
 
-        console.print("[green]Unknown CMS[/green]")
+        if not return_details:
+            console.print("[green]Unknown CMS[/green]")
         return {"score": 0, "findings": []} if return_details else False
 
     except Exception as e:
@@ -821,9 +1177,9 @@ def audit_domain(domain):
         console.print(f"[red]Connection failed:[/red] {e}")
         return
 
-    table = Table(title="Security Audit")
-    table.add_column("Check", style="yellow")
-    table.add_column("Status", style="green")
+    table = make_table("Security Audit")
+    add_text_column(table, "Check", style="yellow", ratio=2)
+    add_text_column(table, "Status", style="green", ratio=3)
 
     # Security headers
     for header in SECURITY_HEADERS:
@@ -839,9 +1195,9 @@ def audit_domain(domain):
     console.print(table)
 
     # Passive upload discovery
-    upload_table = Table(title="Possible Upload Surfaces")
-    upload_table.add_column("Path", style="yellow")
-    upload_table.add_column("HTTP")
+    upload_table = make_table("Possible Upload Surfaces")
+    add_url_column(upload_table, "Path", style="cyan", ratio=5)
+    add_text_column(upload_table, "HTTP", ratio=1)
 
     found = False
 
@@ -866,9 +1222,9 @@ def audit_domain(domain):
         soup = BeautifulSoup(r.text, "html.parser")
         forms = soup.find_all("form")
 
-        form_table = Table(title="HTML Forms")
-        form_table.add_column("Action")
-        form_table.add_column("Method")
+        form_table = make_table("HTML Forms")
+        add_text_column(form_table, "Action", ratio=4)
+        add_text_column(form_table, "Method", ratio=1)
 
         for form in forms:
             action = form.get("action", "unknown")
@@ -915,9 +1271,9 @@ def check_missing_security_headers(domain, *, session=None, return_details=False
         console.print(f"[red]Connection failed:[/red] {e}")
         return {"score": 0, "findings": []} if return_details else False
 
-    table = Table(title="Missing Security Headers")
-    table.add_column("Header", style="yellow")
-    table.add_column("Status", style="green")
+    table = make_table("Missing Security Headers")
+    add_text_column(table, "Header", style="yellow", ratio=2)
+    add_text_column(table, "Status", style="green", ratio=1)
 
     missing = 0
     findings = []
@@ -985,9 +1341,9 @@ def check_upload_misconfig(domain, *, session=None, show_progress=True, return_d
 
     upload_table = None
     if not return_details:
-        upload_table = Table(title="Possible Upload Endpoints (Passive)")
-        upload_table.add_column("URL", style="yellow")
-        upload_table.add_column("HTTP")
+        upload_table = make_table("Possible Upload Endpoints (Passive)")
+        add_url_column(upload_table, "URL", style="cyan", ratio=5)
+        add_text_column(upload_table, "HTTP", ratio=1)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = []
@@ -1018,35 +1374,99 @@ def check_upload_misconfig(domain, *, session=None, show_progress=True, return_d
     if found and upload_table is not None:
         console.print(upload_table)
 
-    try:
-        soup = BeautifulSoup(r.text, "html.parser")
-        forms = soup.find_all("form")
-        file_forms = []
+    disallows, sitemaps = fetch_robots_paths(session, domain)
+    if not sitemaps:
+        sitemaps = {build_url(domain, "/sitemap.xml")}
 
-        for form in forms:
-            file_inputs = form.find_all("input", attrs={"type": re.compile(r"^file$", re.I)})
-            if file_inputs:
+    seed_urls = [domain]
+    for p in sorted(disallows)[:50]:
+        if p.startswith("/"):
+            seed_urls.append(build_url(domain, p))
+
+    for sm in list(sitemaps)[:3]:
+        for u in fetch_sitemap_urls(session, sm, limit=120):
+            host = parse_hostname(u)
+            if host and host == urlparse(domain).netloc:
+                seed_urls.append(u)
+
+    queue = []
+    seen = set()
+    for u in seed_urls:
+        if u and u not in seen:
+            queue.append(u)
+            seen.add(u)
+
+    visited = set()
+    all_file_forms = []
+
+    def analyze_page(url):
+        rr, _ = safe_request(session, "GET", url, timeout=DEFAULT_TIMEOUT)
+        if rr is None or rr.status_code not in [200, 301, 302, 403]:
+            return set()
+
+        if not is_probably_html_response(rr):
+            return set()
+
+        html = rr.text or ""
+        links = extract_internal_links(html, rr.url, urlparse(domain).netloc)
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for form in soup.find_all("form"):
+                file_inputs = form.find_all("input", attrs={"type": re.compile(r"^file$", re.I)})
+                if not file_inputs:
+                    continue
+
                 action = (form.get("action") or "").strip()
                 method = (form.get("method") or "GET").upper()
                 enctype = (form.get("enctype") or "unknown").lower()
-                action_url = urljoin(domain.rstrip("/") + "/", action) if action else domain
-                file_forms.append((action_url, method, enctype))
-                form_hits.append((action_url, method, enctype))
+                action_url = urljoin(rr.url.rstrip("/") + "/", action) if action else rr.url
 
-        if file_forms:
-            if not return_details:
-                form_table = Table(title="Forms With File Input")
-                form_table.add_column("Action", style="yellow")
-                form_table.add_column("Method")
-                form_table.add_column("Enctype")
+                all_file_forms.append((action_url, method, enctype))
+        except Exception:
+            pass
 
-                for action_url, method, enctype in file_forms[:50]:
-                    form_table.add_row(action_url, method, enctype)
+        return links
 
-                console.print(form_table)
-            found = True
-    except Exception:
-        pass
+    if show_progress:
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Searching upload forms...", total=MAX_CRAWL_PAGES)
+            while queue and len(visited) < MAX_CRAWL_PAGES:
+                url = queue.pop(0)
+                if url in visited:
+                    continue
+                visited.add(url)
+                links = analyze_page(url)
+                for link in links:
+                    if link not in visited and link not in queue and (len(visited) + len(queue)) < MAX_CRAWL_PAGES:
+                        queue.append(link)
+                progress.advance(task)
+    else:
+        while queue and len(visited) < MAX_CRAWL_PAGES:
+            url = queue.pop(0)
+            if url in visited:
+                continue
+            visited.add(url)
+            links = analyze_page(url)
+            for link in links:
+                if link not in visited and link not in queue and (len(visited) + len(queue)) < MAX_CRAWL_PAGES:
+                    queue.append(link)
+
+    if all_file_forms:
+        for action_url, method, enctype in all_file_forms[:200]:
+            form_hits.append((action_url, method, enctype))
+        found = True
+
+        if not return_details:
+            form_table = make_table("Forms With File Input (Crawled)")
+            add_url_column(form_table, "Action", style="cyan", ratio=5)
+            add_text_column(form_table, "Method", ratio=1)
+            add_text_column(form_table, "Enctype", ratio=2)
+
+            for action_url, method, enctype in all_file_forms[:50]:
+                form_table.add_row(action_url, method, enctype)
+
+            console.print(form_table)
 
     if found:
         if not return_details:
@@ -1259,8 +1679,8 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
 
     if error_disclosures:
         if not return_details:
-            table = Table(title="SQL Error Disclosure Indicators")
-            table.add_column("URL", style="red")
+            table = make_table("SQL Error Disclosure Indicators")
+            add_url_column(table, "URL", style="red", ratio=6)
             for u in sorted(list(error_disclosures))[:50]:
                 table.add_row(u)
             console.print(table)
@@ -1268,9 +1688,9 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
 
     if urls_with_params:
         if not return_details:
-            table = Table(title="Potential SQLi Parameters (from URLs)")
-            table.add_column("URL", style="yellow")
-            table.add_column("Parameter(s)", style="red")
+            table = make_table("Potential SQLi Parameters (from URLs)")
+            add_url_column(table, "URL", style="cyan", ratio=6)
+            add_text_column(table, "Parameter(s)", style="red", ratio=2)
             for u in sorted(urls_with_params.keys())[:50]:
                 params = ", ".join(sorted(urls_with_params[u]))
                 table.add_row(u, params)
@@ -1279,9 +1699,9 @@ def check_sqli_indicators(domain, *, session=None, show_progress=True, return_de
 
     if forms_with_params:
         if not return_details:
-            table = Table(title="Potential SQLi Parameters (from Forms)")
-            table.add_column("Form", style="yellow")
-            table.add_column("Parameter(s)", style="red")
+            table = make_table("Potential SQLi Parameters (from Forms)")
+            add_text_column(table, "Form", style="cyan", ratio=6)
+            add_text_column(table, "Parameter(s)", style="red", ratio=2)
             for k in sorted(forms_with_params.keys())[:50]:
                 params = ", ".join(sorted(forms_with_params[k]))
                 table.add_row(k, params)
@@ -1586,12 +2006,12 @@ def display_results():
         console.print("\n[green]No suspicious files found[/green]")
         return
 
-    table = Table(title="Suspicious Files")
+    table = make_table("Suspicious Files")
 
-    table.add_column("#", style="cyan")
-    table.add_column("Path", style="yellow")
-    table.add_column("Findings", style="red")
-    table.add_column("Size")
+    add_text_column(table, "#", style="cyan", ratio=1)
+    add_text_column(table, "Path", style="yellow", ratio=5)
+    add_text_column(table, "Findings", style="red", ratio=4)
+    add_text_column(table, "Size", ratio=1)
 
     for i, result in enumerate(scan_results, 1):
         table.add_row(
@@ -1643,10 +2063,10 @@ def audit_upload_surfaces(directory):
                 })
 
     if findings:
-        table = Table(title="Potential Upload Surfaces")
-        table.add_column("Directory", style="yellow")
-        table.add_column("Permissions", style="red")
-        table.add_column("Risk")
+        table = make_table("Potential Upload Surfaces")
+        add_text_column(table, "Directory", style="yellow", ratio=5)
+        add_text_column(table, "Permissions", style="red", ratio=1)
+        add_text_column(table, "Risk", ratio=1)
 
         for item in findings:
             table.add_row(
@@ -1664,9 +2084,9 @@ def audit_upload_surfaces(directory):
 def audit_permissions(directory):
     console.print("[cyan][*][/cyan] Auditing dangerous permissions...")
 
-    table = Table(title="Dangerous Permissions")
-    table.add_column("Path", style="yellow")
-    table.add_column("Permission", style="red")
+    table = make_table("Dangerous Permissions")
+    add_text_column(table, "Path", style="yellow", ratio=5)
+    add_text_column(table, "Permission", style="red", ratio=1)
 
     found = False
 
@@ -1724,8 +2144,8 @@ def analyze_logs():
             pass
 
     if findings:
-        table = Table(title="Suspicious Log Entries")
-        table.add_column("Entry", style="red")
+        table = make_table("Suspicious Log Entries")
+        add_text_column(table, "Entry", style="red", ratio=8)
 
         for item in findings[:50]:
             table.add_row(item)
@@ -1829,6 +2249,7 @@ def menu():
 [11] Change Target Domain
 [12] Run All Scans (Auto)
 [13] Scan XSS Indicators (DOM/HTML)
+[14] Discover Subdomains (Passive)
 [0] Exit
 """)
 
@@ -1908,7 +2329,7 @@ def menu():
 
             with Progress() as progress:
                 session = get_http_session()
-                task = progress.add_task("[cyan]Running all scans...", total=11)
+                task = progress.add_task("[cyan]Running all scans...", total=12)
                 for name, fn in [
                     ("Upload Misconfig", lambda d: check_upload_misconfig(d, session=session, show_progress=False, return_details=True)),
                     ("SQLi Indicators", lambda d: check_sqli_indicators(d, session=session, show_progress=False, return_details=True)),
@@ -1921,6 +2342,7 @@ def menu():
                     ("Git Exposure", lambda d: check_git_exposure(d, session=session, return_details=True)),
                     ("HTTP Methods", lambda d: check_http_methods(d, session=session, return_details=True)),
                     ("XSS Indicators", lambda d: check_xss_indicators(d, session=session, show_progress=False, return_details=True)),
+                    ("Subdomain Discovery", lambda d: discover_subdomain_references(d, session=session, show_progress=False, return_details=True)),
                 ]:
                     run(name, fn)
                     progress.advance(task)
@@ -1937,12 +2359,12 @@ def menu():
                 )
             )
 
-            summary = Table(title="Scan Summary (Scored)")
-            summary.add_column("Module", style="yellow")
-            summary.add_column("Score")
-            summary.add_column("Risk")
-            summary.add_column("Findings")
-            summary.add_column("Top URL", style="cyan")
+            summary = make_table("Scan Summary (Scored)")
+            add_text_column(summary, "Module", style="yellow", ratio=2)
+            add_text_column(summary, "Score", ratio=1)
+            add_text_column(summary, "Risk", ratio=1)
+            add_text_column(summary, "Findings", ratio=1)
+            add_url_column(summary, "Top URL", style="cyan", ratio=6)
 
             module_results.sort(key=lambda x: x["score"], reverse=True)
             for m in module_results:
@@ -1958,12 +2380,12 @@ def menu():
 
             if all_findings:
                 all_findings.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
-                table = Table(title="Top Findings (URLs + Score)")
-                table.add_column("Score")
-                table.add_column("Risk")
-                table.add_column("Module", style="yellow")
-                table.add_column("URL", style="cyan")
-                table.add_column("Detail", style="red")
+                table = make_table("Top Findings (URLs + Score)")
+                add_text_column(table, "Score", ratio=1)
+                add_text_column(table, "Risk", ratio=1)
+                add_text_column(table, "Module", style="yellow", ratio=2)
+                add_url_column(table, "URL", style="cyan", ratio=6)
+                add_text_column(table, "Detail", style="red", ratio=4)
 
                 for f in all_findings[:30]:
                     table.add_row(
@@ -1978,6 +2400,9 @@ def menu():
 
         elif choice == "13":
             check_xss_indicators(domain)
+
+        elif choice == "14":
+            discover_subdomain_references(domain)
 
         elif choice == "0":
             console.print("[bold red]Goodbye[/bold red]")
