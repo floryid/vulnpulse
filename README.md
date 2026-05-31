@@ -13,15 +13,23 @@ Real-time Defensive Web Audit Toolkit (passive scanning) + Webshell hygiene util
 ### Requirements
 
 - Python 3.10+ (recommended)
-- Packages:
-  - `rich`
-  - `requests`
-  - `beautifulsoup4`
+- Python packages:
+  - `rich` `requests` `beautifulsoup4`
 
-Install:
+### Install (Linux)
+
+Recommended (virtual environment):
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install rich requests beautifulsoup4
+```
+
+### Install (Windows)
+
+```powershell
+py -m pip install rich requests beautifulsoup4
 ```
 
 ### Run
@@ -40,17 +48,19 @@ When you run the app, enter your target domain once. VulnPulse will:
 ### Main Menu (Domain Audit)
 
 - **[1] Upload Misconfiguration**: discovers common upload endpoints + file-upload form indicators (passive).
-- **[2] SQLi Indicators**: crawls internal pages and lists parameterized URLs/forms + possible SQL error disclosure indicators (no exploitation).
+- **[2] SQLi Indicators**: crawls internal pages and lists parameterized URLs/forms + possible SQL error disclosure indicators + hidden params (no exploitation).
 - **[3] Directory Listing**: checks common directories for “Index of”.
-- **[4] Backup Exposure**: checks common backup file names (`backup.zip`, `website.zip`, etc.).
-- **[5] Missing Security Headers**: checks recommended headers and scores missing items.
+- **[4] Backup Exposure**: checks common backup file names (`backup.zip`, `website.zip`, etc.) and derived paths.
+- **[5] Missing Security Headers**: samples multiple pages and shows coverage.
 - **[6] Admin Panels**: probes common admin paths and reports reachable panels.
-- **[7] Sensitive File Exposure**: checks common sensitive files (`.env`, `config.php.bak`, `.git/config`).
-- **[8] CMS Fingerprint**: lightweight fingerprinting.
-- **[9] Public Git Exposure**: checks `.git/`.
+- **[7] Sensitive File Exposure**: checks common sensitive files (`.env`, `composer.lock`, `package.json`, etc.).
+- **[8] CMS Fingerprint**: lightweight fingerprinting across multiple pages.
+- **[9] Public Git Exposure**: checks common `.git` resources.
 - **[10] Dangerous HTTP Methods**: checks `Allow` header from `OPTIONS`.
+- **[11] Change Target Domain**: switch target without restarting.
 - **[12] Run All Scans (Auto)**: runs all modules, prints modern scored summary + full URLs.
-- **[13] XSS Indicators (DOM/HTML)**: detects risk indicators (CSP weakness, DOM sinks, inline handlers) without payload injection.
+- **[13] XSS Indicators (DOM/HTML)**: detects risk indicators (CSP weakness, DOM sinks, inline handlers) without payload injection (also scans JS).
+- **[14] Discover Subdomains (Passive)**: extracts subdomain references from HTML/headers/JS + sitemap URLs (no brute-force).
 
 ## Scoring
 
